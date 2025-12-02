@@ -240,6 +240,7 @@ class AbsoluteActions(DataTransformFn):
         dims = mask.shape[-1]
         actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
         data["actions"] = actions
+        print("actions shape after AbsoluteActions:", data["actions"].shape)
 
         return data
 
@@ -334,6 +335,7 @@ class PadStatesAndActions(DataTransformFn):
         data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
         if "actions" in data:
             data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
+            print("actions shape after PadStatesAndActions:", data["actions"].shape)
         return data
 
 

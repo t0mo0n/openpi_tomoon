@@ -5,6 +5,12 @@ import numpy as np
 import numpydantic
 import pydantic
 
+try:
+    import cupy
+    CUPY_AVAILABLE = cupy.is_available()
+except ImportError:
+    cupy = None
+    CUPY_AVAILABLE = False
 
 @pydantic.dataclasses.dataclass
 class NormStats:
@@ -17,7 +23,7 @@ class NormStats:
 class RunningStats:
     """Compute running statistics of a batch of vectors."""
 
-    def __init__(self):
+    def __init__(self, use_gpu: bool = False):
         self._count = 0
         self._mean = None
         self._mean_of_squares = None
@@ -27,6 +33,18 @@ class RunningStats:
         self._bin_edges = None
         self._num_quantile_bins = 5000  # for computing quantiles on the fly
 
+        # 选择计算后端 (cupy 或 numpy)
+        if use_gpu and CUPY_AVAILABLE:
+            self._backend = cupy
+            self._device = "gpu"
+            print("RunningStats: Using CuPy for GPU acceleration.")
+        else:
+            self._backend = np
+            self._device = "cpu"
+            if use_gpu:
+                print("RunningStats: CuPy not available or no GPU found. Falling back to NumPy on CPU.")
+
+
     def update(self, batch: np.ndarray) -> None:
         """
         Update the running statistics with a batch of vectors.
@@ -34,35 +52,39 @@ class RunningStats:
         Args:
             vectors (np.ndarray): An array where all dimensions except the last are batch dimensions.
         """
+        # 将输入数据移动到选择的设备上
+        batch = self._backend.asarray(batch)
+
         batch = batch.reshape(-1, batch.shape[-1])
         num_elements, vector_length = batch.shape
         if self._count == 0:
-            self._mean = np.mean(batch, axis=0)
-            self._mean_of_squares = np.mean(batch**2, axis=0)
-            self._min = np.min(batch, axis=0)
-            self._max = np.max(batch, axis=0)
-            self._histograms = [np.zeros(self._num_quantile_bins) for _ in range(vector_length)]
+            self._mean = self._backend.mean(batch, axis=0)
+            self._mean_of_squares = self._backend.mean(batch**2, axis=0)
+            self._min = self._backend.min(batch, axis=0)
+            self._max = self._backend.max(batch, axis=0)
+            self._histograms = [self._backend.zeros(self._num_quantile_bins) for _ in range(vector_length)]
+            # np.linspace 在 cupy 中也可用
             self._bin_edges = [
-                np.linspace(self._min[i] - 1e-10, self._max[i] + 1e-10, self._num_quantile_bins + 1)
+                self._backend.linspace(self._min[i] - 1e-10, self._max[i] + 1e-10, self._num_quantile_bins + 1)
                 for i in range(vector_length)
             ]
         else:
             if vector_length != self._mean.size:
                 raise ValueError("The length of new vectors does not match the initialized vector length.")
-            new_max = np.max(batch, axis=0)
-            new_min = np.min(batch, axis=0)
-            max_changed = np.any(new_max > self._max)
-            min_changed = np.any(new_min < self._min)
-            self._max = np.maximum(self._max, new_max)
-            self._min = np.minimum(self._min, new_min)
+            new_max = self._backend.max(batch, axis=0)
+            new_min = self._backend.min(batch, axis=0)
+            max_changed = self._backend.any(new_max > self._max)
+            min_changed = self._backend.any(new_min < self._min)
+            self._max = self._backend.maximum(self._max, new_max)
+            self._min = self._backend.minimum(self._min, new_min)
 
             if max_changed or min_changed:
                 self._adjust_histograms()
 
         self._count += num_elements
 
-        batch_mean = np.mean(batch, axis=0)
-        batch_mean_of_squares = np.mean(batch**2, axis=0)
+        batch_mean = self._backend.mean(batch, axis=0)
+        batch_mean_of_squares = self._backend.mean(batch**2, axis=0)
 
         # Update running mean and mean of squares.
         self._mean += (batch_mean - self._mean) * (num_elements / self._count)
@@ -81,26 +103,39 @@ class RunningStats:
             raise ValueError("Cannot compute statistics for less than 2 vectors.")
 
         variance = self._mean_of_squares - self._mean**2
-        stddev = np.sqrt(np.maximum(0, variance))
+        stddev = self._backend.sqrt(self._backend.maximum(0, variance))
         q01, q99 = self._compute_quantiles([0.01, 0.99])
-        return NormStats(mean=self._mean, std=stddev, q01=q01, q99=q99)
+
+        # 将结果从 GPU 转回 CPU (如果需要)
+        if self._device == "gpu":
+            mean_np = self._mean.get()
+            stddev_np = stddev.get()
+            q01_np = q01.get()
+            q99_np = q99.get()
+        else:
+            mean_np = self._mean
+            stddev_np = stddev
+            q01_np = q01
+            q99_np = q99
+
+        return NormStats(mean=mean_np, std=stddev_np, q01=q01_np, q99=q99_np)
 
     def _adjust_histograms(self):
         """Adjust histograms when min or max changes."""
         for i in range(len(self._histograms)):
             old_edges = self._bin_edges[i]
-            new_edges = np.linspace(self._min[i], self._max[i], self._num_quantile_bins + 1)
+            new_edges = self._backend.linspace(self._min[i], self._max[i], self._num_quantile_bins + 1)
 
             # Redistribute the existing histogram counts to the new bins
-            new_hist, _ = np.histogram(old_edges[:-1], bins=new_edges, weights=self._histograms[i])
+            new_hist, _ = self._backend.histogram(old_edges[:-1], bins=new_edges, weights=self._histograms[i])
 
             self._histograms[i] = new_hist
             self._bin_edges[i] = new_edges
 
-    def _update_histograms(self, batch: np.ndarray) -> None:
+    def _update_histograms(self, batch) -> None:
         """Update histograms with new vectors."""
         for i in range(batch.shape[1]):
-            hist, _ = np.histogram(batch[:, i], bins=self._bin_edges[i])
+            hist, _ = self._backend.histogram(batch[:, i], bins=self._bin_edges[i])
             self._histograms[i] += hist
 
     def _compute_quantiles(self, quantiles):
@@ -110,10 +145,10 @@ class RunningStats:
             target_count = q * self._count
             q_values = []
             for hist, edges in zip(self._histograms, self._bin_edges, strict=True):
-                cumsum = np.cumsum(hist)
-                idx = np.searchsorted(cumsum, target_count)
+                cumsum = self._backend.cumsum(hist)
+                idx = self._backend.searchsorted(cumsum, target_count)
                 q_values.append(edges[idx])
-            results.append(np.array(q_values))
+            results.append(self._backend.array(q_values))
         return results
 
 

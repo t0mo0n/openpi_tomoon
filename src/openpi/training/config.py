@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.franka_text_policy as franka_text_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -352,6 +353,88 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
+    
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotFrankaTextDataConfig(DataConfigFactory):
+    """
+    针对自定义 Franka 数据集的配置类。
+    """
+    # 是否将关节动作转换为相对动作 (Delta)。Pi0 通常在 Delta 空间训练效果更好。
+    # Franka 有 7 个关节，最后 1 维是夹爪。
+    use_delta_joint_actions: bool = True
+
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    # repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+    #     default=_transforms.Group(
+    #         inputs=[
+    #             _transforms.RepackTransform(
+    #                 {
+    #                     "image": {
+    #                         "image_1": "observation.images.image_1",
+    #                         "image_2": "observation.images.image_2",
+    #                         },
+    #                     "state": "observation.state",
+    #                     "actions": "action",
+    #                     "prompt": "prompt",
+    #                 }
+    #             )
+    #         ]
+    #     ),
+    # )
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # 1. Repack Transform: 键名映射
+        # 将数据集 info.json 中的原始键名映射为 Pi0 模型内部使用的标准键名
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+
+                        "image_1": "observation.images.image_1",
+                        "image_2": "observation.images.image_2",
+                        
+                        # 状态和动作映射
+                        "state": "observation.state",
+                        "actions": "action",  # info.json 中是 "action"，模型内部通常用 "actions"
+                        "prompt": "prompt",   # 如果启用 prompt_from_task，任务描述会在这里
+                    }
+                )
+            ]
+        )
+
+        # 2. Data Transforms: 数据处理
+        data_transforms = _transforms.Group(
+            inputs=[franka_text_policy.FrankaInputs(model_type=model_config.model_type)],
+            outputs=[franka_text_policy.FrankaOutputs()],
+        )
+
+        # 处理 Delta 动作转换
+        if self.use_delta_joint_actions:
+            # 创建掩码：前7维 (关节) 为 True (做Delta转换)，第8维 (夹爪) 为 False (保持绝对值)
+            # make_bool_mask(True的数量, False的数量)
+            delta_action_mask = _transforms.make_bool_mask(7, -1)
+            
+            data_transforms = data_transforms.push(
+                # 输入模型前：转为 Delta
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                # 模型输出后（推理时）：转回绝对值
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        # 3. Model Transforms: 标准模型预处理 (Tokenization, Resize 等)
+        model_transforms = ModelTransformFactory()(model_config)
+
+        # 返回构建好的 DataConfig
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -524,6 +607,8 @@ class TrainConfig:
     # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
+
+    gradient_accumulation_steps: int = 1
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -751,6 +836,68 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    #
+    # Customed LeRobot Franka config example.
+    #
+    TrainConfig(
+        name="pi0_franka_text_custom",  # 你的配置名称，运行训练时使用这个名字
+        
+        # 模型配置
+        model=pi0_config.Pi0Config(
+            action_dim=32,      # 虽然动作是8维, 但是需要mask到32维以匹配模型输入
+            # action_horizon=10,  # 动作预测长度，通常 10-16 之间
+            # max_token_len=256,  # 如果显存允许，可以设大一点防止截断
+        ),
+        
+        # 数据配置
+        data=LeRobotFrankaTextDataConfig(
+            # 这里的 repo_id 填你数据集的名称
+            # 如果是本地 LeRobot 数据集，确保路径格式正确
+            repo_id="/home/tomoon/datasets/Rlbench/textOnly/TextOnly_FromRLBench_CloseBox_24K_unfixed", 
+            
+            base_config=DataConfig(
+                # 从 task.jsonl 读取任务描述作为 Prompt
+                prompt_from_task=True,
+            ),
+            # 指定 Asset ID 用于加载归一化统计数据 (Norm Stats)
+            # 你需要先计算并保存该数据集的 norm stats，否则训练效果会很差
+            assets=AssetsConfig(
+                assets_dir="/home/tomoon/datasets/Rlbench/textOnly/assets",
+                asset_id="franka_text_custom_stats", 
+            ),
+
+            action_sequence_keys= ("action",),
+
+            # repack_transforms = _transforms.Group(
+            #     inputs=[
+            #         _transforms.RepackTransform(
+            #             {
+            #                 "image": {
+            #                     # 将 info.json 中的 "observation.images.image_1" 映射为 "image_1"
+            #                     "image_1": "observation.images.image_1",
+            #                     # 如果你想用第二个摄像头，可以映射为 "image_2" 或其他
+            #                     "image_2": "observation.images.image_2", 
+            #                     },
+                            
+            #                 # 状态和动作映射
+            #                 "state": "observation.state",
+            #                 "actions": "action",  # info.json 中是 "action"，模型内部通常用 "actions"
+            #                 "prompt": "prompt",   # 如果启用 prompt_from_task，任务描述会在这里
+            #             }
+            #         )
+            #     ]
+            # ),
+        ),
+        
+        # # 加载 Pi0 预训练权重
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        
+        # 训练参数
+        num_train_steps=20_000,
+        batch_size=4,  # 根据显存调整
+        save_interval=1000,
+        gradient_accumulation_steps=8,  # 根据 batch_size 和显存调整
     ),
     #
     # Fine-tuning Aloha configs.
